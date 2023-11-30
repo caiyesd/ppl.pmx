@@ -25,3 +25,5 @@ from .RowParallelLinear import row_parallel_linear
 from .SiLU import silu
 
 from . import dynamic_batching
+
+from .ALiBi import alibi_position_embedding

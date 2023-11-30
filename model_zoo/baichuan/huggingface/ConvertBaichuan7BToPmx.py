@@ -73,6 +73,12 @@ def write_pmx_model(model_path, input_base_path):
         pmx_params_dict['intermediate_dim'] = params.get("intermediate_size")
     else:
         pmx_params_dict['intermediate_dim'] = compute_intermediate_size(hidden_dim, ffn_dim_multiplier, multiple_of)
+
+    # guess whether need alibi, 7B: 32 layers, 13B 40 layers.
+    pmx_params_dict['is_alibi'] = False
+    if params['num_hidden_layers'] > 32:
+        pmx_params_dict['is_alibi'] = True
+
     write_json(pmx_params_dict, os.path.join(model_path, "pmx_params.json"))
 
     # TO DO: GQA / MQA, only test on llama

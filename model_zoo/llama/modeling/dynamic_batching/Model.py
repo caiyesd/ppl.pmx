@@ -4,6 +4,7 @@ import os
 import torch
 from torch import nn
 import torch.distributed as dist
+import math
 
 from typing import Mapping, Any, Optional
 
@@ -61,11 +62,13 @@ class Attention(nn.Module):
         self.cache_quant_group = args.cache_quant_group
         self.cache_layout = args.cache_layout
         self.cache_mode = args.cache_mode
+        self.is_alibi = args.is_alibi
 
         self.friendly_gqa = friendly_gqa
         self.fused_qkv = fused_qkv
         self.fused_kvcache = fused_kvcache
         self.auto_causal = args.auto_causal
+
 
         if self.fused_qkv:
             self.wqkv = ColumnParallelLinear(
@@ -107,11 +110,12 @@ class Attention(nn.Module):
         # TensorDumper.dump(xk, "layer{}_reshaped_xk".format(self.layer_id))
         # TensorDumper.dump(xv, "layer{}_reshaped_xv".format(self.layer_id))
 
-        xq, xk = PMX.dynamic_batching.rotary_position_embedding(
-                                        xq, xk, seqstarts,
-                                        start_pos, max_seqlen)
-        # TensorDumper.dump(xq, "layer{}_rotary_position_embedding_out_xq".format(self.layer_id))
-        # TensorDumper.dump(xk, "layer{}_rotary_position_embedding_out_xk".format(self.layer_id))
+        if not self.is_alibi:
+            xq, xk = PMX.dynamic_batching.rotary_position_embedding(
+                                            xq, xk, seqstarts,
+                                            start_pos, max_seqlen)
+            # TensorDumper.dump(xq, "layer{}_rotary_position_embedding_out_xq".format(self.layer_id))
+            # TensorDumper.dump(xk, "layer{}_rotary_position_embedding_out_xk".format(self.layer_id))
 
         if self.fused_kvcache:
             attn = PMX.dynamic_batching.multi_head_cache_attention(
@@ -261,6 +265,12 @@ class Transformer(nn.Module):
         self.proc_group = proc_group
         self.fused_qkv = fused_qkv
         self.fused_kvcache = fused_kvcache
+        self.first_run = True
+        self.world_size = torch.distributed.get_world_size(group=self.proc_group)
+        self.local_rank = torch.distributed.get_rank(group=self.proc_group)
+        self.num_heads = self.params.num_heads
+        self.num_local_heads =self.num_heads // self.world_size
+
 
         world_size = 1 if proc_group is None else proc_group.size()
         num_kv_heads = params.num_heads if params.num_kv_heads is None else params.num_kv_heads
@@ -313,6 +323,26 @@ class Transformer(nn.Module):
         TensorDumper.dump(kv_cache, "kv_cache")
         if kv_scale is not None:
             TensorDumper.dump(kv_scale, "kv_scale")
+
+        if self.params.is_alibi:
+            curr_pos = kvstarts[-1]
+            if self.first_run or curr_pos > self.max_cache_pos:
+                if self.first_run:
+                    self.first_run = False
+                    self.max_cache_pos = 4096
+                if curr_pos > self.max_cache_pos:
+                    while self.max_cache_pos < curr_pos:
+                         self.max_cache_pos = self.max_cache_pos + 4096
+
+                alibi_mask = torch.zeros((self.num_heads, self.max_cache_pos, self.max_cache_pos), dtype=torch.float16)
+                alibi_mask = PMX.alibi_position_embedding(alibi_mask, torch.tensor(self.max_cache_pos), torch.tensor(self.max_cache_pos), self.num_heads)
+                beg = self.num_local_heads*self.local_rank
+                end = self.num_local_heads*self.local_rank + self.num_local_heads
+                alibi_mask = alibi_mask[beg:end, :, :].cuda()
+                self.register_buffer("future_mask", alibi_mask, persistent=False)
+
+            attn_mask = self.future_mask[ :, :kvstarts[-1], :kvstarts[-1]]
+            attn_mask = attn_mask[ :, -seqstarts[-1]:, :]
 
         norm = None
         for layer in self.layers:

@@ -21,3 +21,4 @@ class ModelParams:
 
     dynamic_batching: bool = True
     auto_causal: bool = True
+    is_alibi: bool = False
